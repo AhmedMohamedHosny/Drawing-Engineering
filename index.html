@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>مترجم المخططات الهندسية | CAD PDF Translator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+  <!-- مكتبة قراءة ورسم ملفات PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- مكتبة تصدير النتيجة كملف PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+  <!-- الشريط العلوي -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-badge">CAD</span>
+      <h1>مترجم المخططات الهندسية</h1>
+    </div>
+
+    <div class="toolbar-group">
+      <label class="btn btn-primary" for="pdfInput">
+        <span>📂 رفع ملف PDF</span>
+        <input type="file" id="pdfInput" accept="application/pdf" hidden />
+      </label>
+
+      <button id="translateBtn" class="btn btn-accent" disabled>
+        ⚡ ترجمة الصفحة تلقائياً
+      </button>
+
+      <button id="manualModeBtn" class="btn btn-secondary" disabled title="ارسم مربعاً على أي نص لم يتم التقاطه تلقائياً">
+        ✏️ إضافة نص يدوي
+      </button>
+
+      <button id="compareBtn" class="btn btn-secondary" disabled title="اضغط مع الاستمرار أو للتبديل لمعاينة الأصل">
+        👁️ معاينة الأصل
+      </button>
+    </div>
+
+    <div class="toolbar-group">
+      <div class="page-controls" id="pageControls" style="display: none;">
+        <button id="prevPageBtn" class="btn btn-icon" title="الصفحة السابقة">◀</button>
+        <span id="pageInfo">1 / 1</span>
+        <button id="nextPageBtn" class="btn btn-icon" title="الصفحة التالية">▶</button>
+      </div>
+
+      <div class="zoom-controls">
+        <button id="zoomOutBtn" class="btn btn-icon" disabled title="تصغير">−</button>
+        <span id="zoomLabel">100%</span>
+        <button id="zoomInBtn" class="btn btn-icon" disabled title="تكبير">+</button>
+        <button id="fitBtn" class="btn btn-icon" disabled title="ملء الشاشة">⛶</button>
+      </div>
+
+      <button id="exportPngBtn" class="btn btn-success" disabled>🖼️ تصدير PNG</button>
+      <button id="exportPdfBtn" class="btn btn-success" disabled>📄 تصدير PDF</button>
+    </div>
+  </header>
+
+  <!-- شريط التقدم -->
+  <div id="progressBarWrap" class="progress-wrap hidden">
+    <div class="progress-info">
+      <span id="progressText">جاري المعالجة...</span>
+      <span id="progressPercent">0%</span>
+    </div>
+    <div class="progress-track">
+      <div id="progressFill" class="progress-fill"></div>
+    </div>
+  </div>
+
+  <!-- مساحة العمل الرئيسية -->
+  <main class="workspace">
+    <!-- القائمة الجانبية -->
+    <aside class="sidebar">
+      <div class="panel-section">
+        <h3>إعدادات الترجمة والعرض</h3>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="ignoreNumbersChk" checked />
+          <span>تجاهل الأرقام والأبعاد ورموز العناصر</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="mergeLinesChk" checked />
+          <span>دمج الكلمات المتجاورة في سطر واحد</span>
+        </label>
+
+        <div class="control-row">
+          <label for="fontScaleRange">حجم الخط العربي: <strong id="fontScaleVal">95%</strong></label>
+          <input type="range" id="fontScaleRange" min="50" max="160" value="95" />
+        </div>
+
+        <div class="control-row inline-colors">
+          <div>
+            <label for="textColorPicker">لون النص</label>
+            <input type="color" id="textColorPicker" value="#0f172a" />
+          </div>
+          <div>
+            <label for="bgColorPicker">خلفية النص</label>
+            <input type="color" id="bgColorPicker" value="#ffffff" />
+          </div>
+          <div>
+            <label for="renderScaleSelect">دقة الرسم</label>
+            <select id="renderScaleSelect">
+              <option value="1.5">متوسطة (سريعة)</option>
+              <option value="2.2" selected>عالية (موصى بها)</option>
+              <option value="3">فائقة (للوحات الكبيرة)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-section list-section">
+        <div class="list-header">
+          <h3>النصوص المكتشفة (<span id="itemsCount">0</span>)</h3>
+          <button id="clearBoxesBtn" class="btn-link" title="حذف كل مربعات الترجمة">مسح الكل</button>
+        </div>
+        <input type="text" id="searchInput" class="search-input" placeholder="🔍 ابحث في النصوص..." />
+        <div id="itemsList" class="items-list">
+          <div class="empty-state">ارفع ملف PDF لبدء استخراج وترجمة النصوص.</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- منطقة عرض المخطط -->
+    <section class="viewport" id="viewport">
+      <div id="dropZone" class="drop-zone">
+        <div class="drop-card">
+          <div class="drop-icon">📐</div>
+          <h2>اسحب ملف المخطط (PDF) هنا</h2>
+          <p>أو اضغط على زر "رفع ملف PDF" بالأعلى</p>
+          <small>الرسومات تبقى كما هي ويتم استبدال النصوص الإنجليزية بالعربية مباشرة على جهازك</small>
+        </div>
+      </div>
+
+      <div id="canvasStage" class="canvas-stage hidden">
+        <canvas id="pdfCanvas"></canvas>
+        <canvas id="overlayCanvas"></canvas>
+      </div>
+
+      <div class="viewport-hint" id="viewportHint">
+        💡 بكرة الماوس: زووم | سحب المساحة الفارغة: تحريك اللوحة | اضغط واسحب أي مربع ترجمة لتعديل مكانه
+      </div>
+    </section>
+  </main>
+
+  <!-- نافذة إضافة نص يدوي -->
+  <div id="manualModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>إضافة مربع ترجمة يدوي</h3>
+      <div class="form-group">
+        <label>النص الإنجليزي (اختياري للترجمة التلقائية):</label>
+        <div class="inline-action">
+          <input type="text" id="manualEnInput" placeholder="مثلاً: INFLUENT WATER TANK" dir="ltr" />
+          <button id="manualAutoTranslateBtn" class="btn btn-accent">ترجم</button>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>النص العربي:</label>
+        <input type="text" id="manualArInput" placeholder="مثلاً: خزان مياه التغذية" />
+      </div>
+      <div class="modal-actions">
+        <button id="manualSaveBtn" class="btn btn-primary">حفظ وإضافة</button>
+        <button id="manualCancelBtn" class="btn btn-secondary">إلغاء</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
