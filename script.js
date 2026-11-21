@@ -68,7 +68,7 @@ let pageBoxesMap = {}; // حفظ مربعات الترجمة لكل صفحة
 let selectedBoxId = null;
 let showOriginalOnly = false;
 let manualDrawMode = false;
-
+let originalPdfBytes = null; // نسخة أصلية من ملف الـ PDF للحفاظ على الـ Vector عند التصدير
 // متغيرات السحب بالماوس
 let isPanning = false;
 let isDraggingBox = false;
@@ -103,8 +103,9 @@ async function loadPdfFile(file) {
   currentFileName = file.name.replace(/\.pdf$/i, '');
   showProgress('جاري تحميل ملف المخطط...', 20);
   try {
-    const arrayBuffer = await file.arrayBuffer();
-    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+const rawBytes = new Uint8Array(await file.arrayBuffer());
+    originalPdfBytes = rawBytes.slice();
+    pdfDoc = await pdfjsLib.getDocument({ data: rawBytes }).promise;
     currentPageNum = 1;
 pageBoxesMap = {};
     dropZone.classList.add('hidden');
@@ -282,7 +283,44 @@ async function extractTextBoxes(page, viewport) {
         processed.push({ ...item });
       }
     }
-    processed = processed.concat(rotated);
+// دمج الأسطر الرأسية المتتالية التي تنتمي لنفس العنوان (مثل أسماء الخزانات)
+    const stackedBlocks = [];
+    for (const line of processed) {
+      const prev = stackedBlocks[stackedBlocks.length - 1];
+      const lineGap = prev ? line.y - prev.lastY : 9999;
+      const sameFont = prev && Math.abs(prev.fontSize - line.fontSize) < prev.fontSize * 0.25;
+      const prevCenter = prev ? prev.x + prev.width / 2 : 0;
+      const currCenter = line.x + line.width / 2;
+      const aligned =
+        prev &&
+        (Math.abs(prev.x - line.x) < prev.fontSize * 3 ||
+          Math.abs(prevCenter - currCenter) < prev.fontSize * 3);
+      const isNewNumberedNote = /^\d+[\.)]\s*/.test(line.str);
+
+      if (
+        prev &&
+        prev.lineCount < 3 &&
+        sameFont &&
+        aligned &&
+        !isNewNumberedNote &&
+        lineGap > prev.fontSize * 0.85 &&
+        lineGap < prev.fontSize * 1.85 &&
+        shouldTranslateText(prev.str) &&
+        shouldTranslateText(line.str)
+      ) {
+        const minX = Math.min(prev.x, line.x);
+        const maxR = Math.max(prev.x + prev.width, line.x + line.width);
+        prev.str = `${prev.str} ${line.str}`;
+        prev.x = minX;
+        prev.width = maxR - minX;
+        prev.height = line.y - (prev.y - prev.fontSize * 0.88) + line.fontSize * 0.3;
+        prev.lastY = line.y;
+        prev.lineCount += 1;
+      } else {
+        stackedBlocks.push({ ...line, lastY: line.y, lineCount: 1 });
+      }
+    }
+    processed = stackedBlocks.concat(rotated);
   } else {
     processed = rawItems;
   }
@@ -312,32 +350,97 @@ async function extractTextBoxes(page, viewport) {
 // 3. الترجمة التلقائية (Google Translate API المجاني + MyMemory كاحتياطي)
 // ==========================================
 async function translateTextSingle(text) {
+  const dict = window.EngineeringDict;
+  if (dict) {
+    const local = dict.lookupLocal(text);
+    if (local.fullyTranslated) return local.text;
+  }
+
+  const protectedData = dict ? dict.protectTechCodes(text) : { masked: text, tokens: [] };
+  let translated = text;
+
   try {
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(text)}`;
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(protectedData.masked)}`;
     const res = await fetch(url);
     if (res.ok) {
       const data = await res.json();
       if (data && data[0]) {
-        return data[0].map((part) => part[0]).join('').trim();
+        translated = data[0].map((part) => part[0]).join('').trim();
       }
     }
   } catch (e) {
-    // الانتقال للمصدر الاحتياطي
+    try {
+      const fallbackUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(protectedData.masked)}&langpair=en|ar`;
+      const res2 = await fetch(fallbackUrl);
+      if (res2.ok) {
+        const data2 = await res2.json();
+        if (data2?.responseData?.translatedText) {
+          translated = data2.responseData.translatedText.trim();
+        }
+      }
+    } catch (e2) {
+      console.error('Translation failed for:', text);
+    }
   }
 
+  if (dict) {
+    translated = dict.restoreTechCodes(translated, protectedData.tokens);
+    translated = dict.postProcessArabic(translated);
+  }
+  return translated;
+}
+
+async function translateBatch(list) {
+  const dict = window.EngineeringDict;
+  const results = new Array(list.length);
+  const needOnlineIdx = [];
+  const needOnlineTexts = [];
+  const protectedList = [];
+
+  list.forEach((raw, i) => {
+    if (dict) {
+      const local = dict.lookupLocal(raw);
+      if (local.fullyTranslated) {
+        results[i] = local.text;
+        return;
+      }
+    }
+    const pData = dict ? dict.protectTechCodes(raw) : { masked: raw, tokens: [] };
+    needOnlineIdx.push(i);
+    needOnlineTexts.push(pData.masked);
+    protectedList.push(pData.tokens);
+  });
+
+  if (!needOnlineTexts.length) return results;
+
   try {
-    const fallbackUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
-    const res2 = await fetch(fallbackUrl);
-    if (res2.ok) {
-      const data2 = await res2.json();
-      if (data2?.responseData?.translatedText) {
-        return data2.responseData.translatedText.trim();
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q=${encodeURIComponent(needOnlineTexts.join('\n'))}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      const fullTranslated = data[0].map((p) => p[0]).join('');
+      const parts = fullTranslated.split('\n').map((s) => s.trim());
+      if (parts.length === needOnlineTexts.length) {
+        parts.forEach((part, k) => {
+          let finalTxt = part;
+          if (dict) {
+            finalTxt = dict.restoreTechCodes(finalTxt, protectedList[k]);
+            finalTxt = dict.postProcessArabic(finalTxt);
+          }
+          results[needOnlineIdx[k]] = finalTxt;
+        });
+        return results;
       }
     }
   } catch (e) {
-    console.error('Translation failed for:', text);
+    // في حالة فشل الدفعة نترجم المتبقي بشكل فردي
   }
-  return text;
+
+  for (let k = 0; k < needOnlineIdx.length; k++) {
+    const origIdx = needOnlineIdx[k];
+    results[origIdx] = await translateTextSingle(list[origIdx]);
+  }
+  return results;
 }
 
 async function translateBatch(list) {
@@ -399,6 +502,62 @@ translateBtn.addEventListener('click', async () => {
 // ==========================================
 // 4. رسم طبقة الترجمة فوق المخطط
 // ==========================================
+function wrapArabicLines(ctx, text, maxWidth) {
+  const words = text.split(/\s+/);
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    const test = current ? `${current} ${word}` : word;
+    if (ctx.measureText(test).width <= maxWidth || !current) {
+      current = test;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+function drawArabicBoxContent(ctx, box, width, height, padX, padY, globalScale, textColor, bgColor) {
+  ctx.fillStyle = bgColor;
+  ctx.fillRect(-padX, -padY, width + padX * 2, height + padY * 2);
+
+  let size = Math.max(7, box.fontSize * globalScale * box.fontAdjust);
+  const allowWrap = height > box.fontSize * 1.45;
+  const maxAllowedWidth = Math.max(width * 1.08, box.fontSize * 2.4);
+
+  let lines = [box.translated];
+  ctx.font = `700 ${size}px Cairo, Tahoma, Arial, sans-serif`;
+
+  if (allowWrap) {
+    lines = wrapArabicLines(ctx, box.translated, maxAllowedWidth);
+    const totalH = lines.length * size * 1.2;
+    if (totalH > height + padY) {
+      size = Math.max(6, size * ((height + padY) / totalH));
+      ctx.font = `700 ${size}px Cairo, Tahoma, Arial, sans-serif`;
+      lines = wrapArabicLines(ctx, box.translated, maxAllowedWidth);
+    }
+  } else {
+    const measured = ctx.measureText(box.translated).width;
+    if (measured > maxAllowedWidth && !box.manual) {
+      size = Math.max(6, size * Math.max(maxAllowedWidth / measured, 0.55));
+      ctx.font = `700 ${size}px Cairo, Tahoma, Arial, sans-serif`;
+    }
+  }
+
+  ctx.fillStyle = textColor;
+  ctx.direction = 'rtl';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const lineHeight = size * 1.18;
+  const startY = height / 2 - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((ln, idx) => {
+    ctx.fillText(ln, width / 2, startY + idx * lineHeight);
+  });
+}
+
 function redrawOverlay(isExporting = false) {
   overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
   if (showOriginalOnly && !isExporting) return;
@@ -419,30 +578,18 @@ function redrawOverlay(isExporting = false) {
       overlayCtx.rotate(box.angle);
     }
 
-    // خلفية تغطية النص الإنجليزي الأصلي
-    overlayCtx.fillStyle = bgColor;
-    overlayCtx.fillRect(-padX, -padY, box.width + padX * 2, box.height + padY * 2);
+    drawArabicBoxContent(
+      overlayCtx,
+      box,
+      box.width,
+      box.height,
+      padX,
+      padY,
+      globalScale,
+      textColor,
+      bgColor
+    );
 
-    // حساب حجم الخط المناسب حتى لا يخرج النص العربي عن المساحة
-    let size = Math.max(7, box.fontSize * globalScale * box.fontAdjust);
-    overlayCtx.font = `600 ${size}px Cairo, Tahoma, Arial, sans-serif`;
-    let measured = overlayCtx.measureText(box.translated).width;
-    const maxAllowedWidth = Math.max(box.width * 1.12, box.fontSize * 2.5);
-
-    if (measured > maxAllowedWidth && !box.manual) {
-      const ratio = maxAllowedWidth / measured;
-      size = Math.max(6, size * Math.max(ratio, 0.58));
-      overlayCtx.font = `600 ${size}px Cairo, Tahoma, Arial, sans-serif`;
-    }
-
-    // رسم النص العربي
-    overlayCtx.fillStyle = textColor;
-    overlayCtx.direction = 'rtl';
-    overlayCtx.textAlign = 'center';
-    overlayCtx.textBaseline = 'middle';
-    overlayCtx.fillText(box.translated, box.width / 2, box.height / 2 + size * 0.05);
-
-    // إطار التحديد (لا يظهر عند التصدير)
     if (!isExporting && box.id === selectedBoxId) {
       overlayCtx.strokeStyle = '#3b82f6';
       overlayCtx.lineWidth = Math.max(1.5, 2 / zoom);
@@ -453,7 +600,6 @@ function redrawOverlay(isExporting = false) {
     overlayCtx.restore();
   }
 
-  // رسم المربع المؤقت أثناء الوضع اليدوي
   if (tempManualRect && !isExporting) {
     overlayCtx.save();
     overlayCtx.strokeStyle = '#f59e0b';
@@ -815,25 +961,10 @@ exportPngBtn.addEventListener('click', () => {
   link.click();
 });
 
-exportPdfBtn.addEventListener('click', () => {
-  showProgress('جاري تجهيز ملف الـ PDF العربي...', 70);
-  setTimeout(() => {
-    const merged = buildMergedCanvas();
-    const imgData = merged.toDataURL('image/jpeg', 0.95);
-    const { jsPDF } = window.jspdf;
-
-    const orientation = merged.width >= merged.height ? 'l' : 'p';
-    const pdf = new jsPDF({
-      orientation,
-      unit: 'px',
-      format: [merged.width, merged.height],
-      hotfixes: ['px_scaling'],
-    });
-
-    pdf.addImage(imgData, 'JPEG', 0, 0, merged.width, merged.height);
-    pdf.save(`${currentFileName}_AR_page${currentPageNum}.pdf`);
-    hideProgress();
-  }, 60);
+exportPdfBtn.addEventListener('click', async () => {
+  if (!pdfDoc) return;
+  pageBoxesMap[currentPageNum] = boxes;
+  await exportVectorPdfPages([currentPageNum], `${currentFileName}_AR_page${currentPageNum}_VECTOR.pdf`);
 });
 
 // أدوات مساعدة
@@ -856,14 +987,27 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 // ==========================================
-// 9. ميزة OCR وتصدير كل الصفحات في PDF واحد
+// 9. مسح OCR فائق الدقة (تقطيع اللوحة لشبكة 4x) + تصدير Vector PDF أصلي
 // ==========================================
-function isOverlappingExisting(x, y, w, h) {
+function isOverlappingExisting(x, y, w, h, list = boxes) {
   const cx = x + w / 2;
   const cy = y + h / 2;
-  return boxes.some(
-    (b) => cx >= b.x && cx <= b.x + b.width && cy >= b.y && cy <= b.y + b.height
+  return list.some(
+    (b) => cx >= b.x - 4 && cx <= b.x + b.width + 4 && cy >= b.y - 4 && cy <= b.y + b.height + 4
   );
+}
+
+// تحسين تباين الصورة لمساعدة الـ OCR على قراءة خطوط الأوتوكاد الرفيعة
+function enhanceCanvasForOcr(canvas) {
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = imgData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    const v = lum < 215 ? Math.max(0, (lum - 80) * 1.4) : 255;
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(imgData, 0, 0);
 }
 
 ocrBtn.addEventListener('click', async () => {
@@ -875,48 +1019,91 @@ ocrBtn.addEventListener('click', async () => {
 
   ocrBtn.disabled = true;
   translateBtn.disabled = true;
-  showProgress('جاري تهيئة محرك OCR (أول مرة قد تستغرق ثوانٍ)...', 5);
+  showProgress('جاري تهيئة محرك OCR فائق الدقة...', 3);
 
   try {
-    const worker = await Tesseract.createWorker('eng', 1, {
-      logger: (m) => {
-        if (m.status === 'recognizing text') {
-          showProgress('جاري مسح النصوص المرسومة بالـ OCR...', Math.round(m.progress * 70));
-        }
-      },
-    });
+    const page = await pdfDoc.getPage(currentPageNum);
+    const baseVp = page.getViewport({ scale: 1 });
 
-    const { data } = await worker.recognize(pdfCanvas);
-    await worker.terminate();
+    // تحديد دقة المسح وتقسيم اللوحة لمربعات (لللوحات الكبيرة A0/A1 نستخدم شبكة 4x3 بدقة عالية)
+    const isLargeSheet = Math.max(baseVp.width, baseVp.height) > 1400;
+    const cols = isLargeSheet ? 4 : 2;
+    const rows = isLargeSheet ? 3 : 2;
+    const ocrScale = isLargeSheet ? 3.5 : 4.0;
+    const ocrVp = page.getViewport({ scale: ocrScale });
 
-    const lines = data.lines || [];
+    const tileW = Math.ceil(ocrVp.width / cols);
+    const tileH = Math.ceil(ocrVp.height / rows);
+    const overlap = 70;
+    const scaleToDisplay = renderScale / ocrScale;
+
+    const worker = await Tesseract.createWorker('eng', 1);
     const newOcrBoxes = [];
+    const totalTiles = cols * rows;
+    let doneTiles = 0;
 
-    lines.forEach((line, idx) => {
-      const text = (line.text || '').replace(/\s+/g, ' ').trim();
-      if (line.confidence < 45 || !shouldTranslateText(text)) return;
+    const tileCanvas = document.createElement('canvas');
+    const tileCtx = tileCanvas.getContext('2d', { willReadFrequently: true });
 
-      const { x0, y0, x1, y1 } = line.bbox;
-      const w = Math.max(20, x1 - x0);
-      const h = Math.max(12, y1 - y0);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        doneTiles++;
+        const pct = Math.round((doneTiles / totalTiles) * 72);
+        showProgress(`جاري مسح المقطع (${doneTiles} من ${totalTiles}) بدقة عالية...`, pct);
 
-      if (isOverlappingExisting(x0, y0, w, h)) return;
+        const sx = Math.max(0, c * tileW - overlap);
+        const sy = Math.max(0, r * tileH - overlap);
+        const sw = Math.min(ocrVp.width - sx, tileW + overlap * 2);
+        const sh = Math.min(ocrVp.height - sy, tileH + overlap * 2);
 
-      newOcrBoxes.push({
-        id: `ocr_${Date.now()}_${idx}`,
-        original: text,
-        translated: '',
-        x: x0,
-        y: y0,
-        width: w,
-        height: h,
-        fontSize: Math.max(10, h * 0.8),
-        angle: 0,
-        fontAdjust: 1,
-        visible: true,
-        manual: false,
-      });
-    });
+        tileCanvas.width = Math.ceil(sw);
+        tileCanvas.height = Math.ceil(sh);
+        tileCtx.fillStyle = '#ffffff';
+        tileCtx.fillRect(0, 0, tileCanvas.width, tileCanvas.height);
+
+        await page.render({
+          canvasContext: tileCtx,
+          viewport: ocrVp,
+          transform: [1, 0, 0, 1, -sx, -sy],
+        }).promise;
+
+        enhanceCanvasForOcr(tileCanvas);
+
+        const { data } = await worker.recognize(tileCanvas);
+        const lines = data.lines || [];
+
+        lines.forEach((line, idx) => {
+          const text = (line.text || '').replace(/\s+/g, ' ').trim();
+          if (line.confidence < 42 || !shouldTranslateText(text)) return;
+
+          const { x0, y0, x1, y1 } = line.bbox;
+          const dx = (x0 + sx) * scaleToDisplay;
+          const dy = (y0 + sy) * scaleToDisplay;
+          const dw = Math.max(18, (x1 - x0) * scaleToDisplay);
+          const dh = Math.max(10, (y1 - y0) * scaleToDisplay);
+
+          if (isOverlappingExisting(dx, dy, dw, dh, boxes)) return;
+          if (isOverlappingExisting(dx, dy, dw, dh, newOcrBoxes)) return;
+
+          newOcrBoxes.push({
+            id: `ocr_${Date.now()}_${doneTiles}_${idx}`,
+            original: text,
+            translated: '',
+            x: dx,
+            y: dy,
+            width: dw,
+            height: dh,
+            fontSize: Math.max(9, dh * 0.82),
+            angle: 0,
+            fontAdjust: 1,
+            visible: true,
+            manual: false,
+          });
+        });
+      }
+    }
+
+    await worker.terminate();
 
     if (!newOcrBoxes.length) {
       hideProgress();
@@ -927,15 +1114,15 @@ ocrBtn.addEventListener('click', async () => {
     boxes = boxes.concat(newOcrBoxes);
     pageBoxesMap[currentPageNum] = boxes;
 
-    // ترجمة النصوص المكتشفة فوراً
-    const chunkSize = 12;
+    // ترجمة النصوص المكتشفة فوراً بالقاموس الهندسي
+    const chunkSize = 15;
     for (let i = 0; i < newOcrBoxes.length; i += chunkSize) {
       const chunk = newOcrBoxes.slice(i, i + chunkSize);
       const translatedArr = await translateBatch(chunk.map((b) => b.original));
       chunk.forEach((box, idx) => {
         box.translated = translatedArr[idx] || box.original;
       });
-      const pct = 70 + Math.round(((i + chunk.length) / newOcrBoxes.length) * 30);
+      const pct = 72 + Math.round(((i + chunk.length) / newOcrBoxes.length) * 28);
       showProgress(`جاري ترجمة نصوص OCR (${Math.min(i + chunk.length, newOcrBoxes.length)} / ${newOcrBoxes.length})...`, pct);
       redrawOverlay();
     }
@@ -951,84 +1138,148 @@ ocrBtn.addEventListener('click', async () => {
   }
 });
 
-exportAllPdfBtn.addEventListener('click', async () => {
-  if (!pdfDoc) return;
+// رسم مربع نص عربي واحد بدقة 4x كـ PNG لدمجه فوق ملف الـ PDF الـ Vector
+async function renderBoxToHiResPngBytes(box, padX, padY, globalScale, textColor, bgColor) {
+  const dpr = 4;
+  const wCss = box.width + padX * 2;
+  const hCss = box.height + padY * 2;
 
-  exportAllPdfBtn.disabled = true;
+  const c = document.createElement('canvas');
+  c.width = Math.max(4, Math.ceil(wCss * dpr));
+  c.height = Math.max(4, Math.ceil(hCss * dpr));
+  const ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.translate(padX, padY);
+
+  drawArabicBoxContent(ctx, box, box.width, box.height, padX, padY, globalScale, textColor, bgColor);
+
+  const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/png'));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+// تصدير Vector PDF أصلي 100% باستخدام pdf-lib (يحافظ على خطوط الأوتوكاد بدون بكسلة)
+async function exportVectorPdfPages(pageNumbers, outputFileName) {
+  if (!originalPdfBytes || typeof PDFLib === 'undefined') {
+    alert('تأكد من تحميل مكتبة pdf-lib والاتصال بالإنترنت.');
+    return;
+  }
+
   exportPdfBtn.disabled = true;
+  exportAllPdfBtn.disabled = true;
   translateBtn.disabled = true;
   ocrBtn.disabled = true;
 
-  const savedPage = currentPageNum;
-  pageBoxesMap[currentPageNum] = boxes;
-
   try {
-    const { jsPDF } = window.jspdf;
-    let pdf = null;
+    showProgress('جاري تجهيز ملف الـ Vector PDF الأصلي...', 10);
 
-    for (let p = 1; p <= pdfDoc.numPages; p++) {
-      const basePct = Math.round(((p - 1) / pdfDoc.numPages) * 100);
-      showProgress(`جاري تجهيز وترجمة الصفحة ${p} من ${pdfDoc.numPages}...`, basePct);
+    const srcDoc = await PDFLib.PDFDocument.load(originalPdfBytes.slice());
+    const outDoc = await PDFLib.PDFDocument.create();
+    const indices = pageNumbers.map((n) => n - 1);
+    const copiedPages = await outDoc.copyPages(srcDoc, indices);
+    copiedPages.forEach((pg) => outDoc.addPage(pg));
 
-      const page = await pdfDoc.getPage(p);
-      const viewport = page.getViewport({ scale: renderScale });
-      pdfCanvas.width = viewport.width;
-      pdfCanvas.height = viewport.height;
-      overlayCanvas.width = viewport.width;
-      overlayCanvas.height = viewport.height;
+    const globalScale = parseInt(fontScaleRange.value, 10) / 100;
+    const textColor = textColorPicker.value;
+    const bgColor = bgColorPicker.value;
 
-      await page.render({ canvasContext: pdfCtx, viewport }).promise;
+    for (let idx = 0; idx < pageNumbers.length; idx++) {
+      const pNum = pageNumbers[idx];
+      const jsPage = await pdfDoc.getPage(pNum);
+      const viewport = jsPage.getViewport({ scale: renderScale });
 
-      if (pageBoxesMap[p]) {
-        boxes = pageBoxesMap[p];
-      } else {
-        await extractTextBoxes(page, viewport);
-        pageBoxesMap[p] = boxes;
+      // لو الصفحة لسه ما استُخرجتش نصوصها نترجمها تلقائياً
+      let pBoxes = pageBoxesMap[pNum];
+      if (!pBoxes) {
+        await extractTextBoxes(jsPage, viewport);
+        pBoxes = boxes;
+        pageBoxesMap[pNum] = pBoxes;
       }
 
-      // ترجمة أي نصوص لم تُترجم بعد في هذه الصفحة
-      const pending = boxes.filter((b) => !b.translated);
-      const chunkSize = 12;
+      const pending = pBoxes.filter((b) => b.visible && !b.translated);
+      const chunkSize = 15;
       for (let i = 0; i < pending.length; i += chunkSize) {
         const chunk = pending.slice(i, i + chunkSize);
-        const translatedArr = await translateBatch(chunk.map((b) => b.original));
-        chunk.forEach((box, idx) => {
-          box.translated = translatedArr[idx] || box.original;
-        });
+        const tr = await translateBatch(chunk.map((b) => b.original));
+        chunk.forEach((b, k) => (b.translated = tr[k] || b.original));
       }
 
-      const merged = buildMergedCanvas();
-      const imgData = merged.toDataURL('image/jpeg', 0.92);
-      const orientation = merged.width >= merged.height ? 'l' : 'p';
+      const outPage = outDoc.getPage(idx);
+      const pageRot = outPage.getRotation().angle || 0;
+      const visibleBoxes = pBoxes.filter((b) => b.visible && b.translated);
 
-      if (p === 1) {
-        pdf = new jsPDF({
-          orientation,
-          unit: 'px',
-          format: [merged.width, merged.height],
-          hotfixes: ['px_scaling'],
+      for (let bIdx = 0; bIdx < visibleBoxes.length; bIdx++) {
+        const box = visibleBoxes[bIdx];
+        const padX = Math.max(2, box.fontSize * 0.15);
+        const padY = Math.max(1.5, box.fontSize * 0.12);
+
+        const pngBytes = await renderBoxToHiResPngBytes(
+          box,
+          padX,
+          padY,
+          globalScale,
+          textColor,
+          bgColor
+        );
+        const embeddedImg = await outDoc.embedPng(pngBytes);
+
+        // تحويل الإحداثيات والزاوية بدقة من Canvas إلى إحداثيات PDF الأصلية
+        const cos = Math.cos(box.angle || 0);
+        const sin = Math.sin(box.angle || 0);
+        const blCanvasX = box.x + -padX * cos - (box.height + padY) * sin;
+        const blCanvasY = box.y + -padX * sin + (box.height + padY) * cos;
+        const [pdfX, pdfY] = viewport.convertToPdfPoint(blCanvasX, blCanvasY);
+
+        const pdfW = (box.width + padX * 2) / renderScale;
+        const pdfH = (box.height + padY * 2) / renderScale;
+        const rotDeg = pageRot - ((box.angle || 0) * 180) / Math.PI;
+
+        outPage.drawImage(embeddedImg, {
+          x: pdfX,
+          y: pdfY,
+          width: pdfW,
+          height: pdfH,
+          rotate: PDFLib.degrees(rotDeg),
         });
-      } else {
-        pdf.addPage([merged.width, merged.height], orientation);
-      }
 
-      pdf.addImage(imgData, 'JPEG', 0, 0, merged.width, merged.height);
+        if (bIdx % 10 === 0) {
+          const pct = Math.min(
+            95,
+            Math.round(((idx + bIdx / Math.max(1, visibleBoxes.length)) / pageNumbers.length) * 90) + 5
+          );
+          showProgress(`جاري تثبيت النصوص العربية بدقة Vector (صفحة ${pNum})...`, pct);
+        }
+      }
     }
 
-    showProgress('جاري حفظ ملف الـ PDF الكامل...', 99);
-    pdf.save(`${currentFileName}_AR_ALL.pdf`);
+    showProgress('جاري حفظ ملف الـ Vector PDF...', 98);
+    const finalBytes = await outDoc.save();
+    const blob = new Blob([finalBytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = outputFileName;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
 
-    // الرجوع للصفحة اللي كنت واقف عليها
-    currentPageNum = savedPage;
-    await renderPage(savedPage);
+    // التأكد من بقاء الصفحة الحالية معروضة
+    boxes = pageBoxesMap[currentPageNum] || boxes;
+    redrawOverlay();
+    renderSidebarList();
     hideProgress();
   } catch (err) {
     hideProgress();
-    alert('حدث خطأ أثناء تصدير كل الصفحات: ' + err.message);
+    alert('حدث خطأ أثناء تصدير Vector PDF: ' + err.message);
   } finally {
-    exportAllPdfBtn.disabled = false;
     exportPdfBtn.disabled = false;
+    exportAllPdfBtn.disabled = false;
     translateBtn.disabled = false;
     ocrBtn.disabled = false;
   }
+}
+
+exportAllPdfBtn.addEventListener('click', async () => {
+  if (!pdfDoc) return;
+  pageBoxesMap[currentPageNum] = boxes;
+  const allPages = Array.from({ length: pdfDoc.numPages }, (_, i) => i + 1);
+  await exportVectorPdfPages(allPages, `${currentFileName}_AR_ALL_VECTOR.pdf`);
 });
