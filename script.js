@@ -9,7 +9,8 @@ const manualModeBtn = document.getElementById('manualModeBtn');
 const compareBtn = document.getElementById('compareBtn');
 const exportPngBtn = document.getElementById('exportPngBtn');
 const exportPdfBtn = document.getElementById('exportPdfBtn');
-
+const ocrBtn = document.getElementById('ocrBtn');
+const exportAllPdfBtn = document.getElementById('exportAllPdfBtn');
 const pageControls = document.getElementById('pageControls');
 const prevPageBtn = document.getElementById('prevPageBtn');
 const nextPageBtn = document.getElementById('nextPageBtn');
@@ -63,6 +64,7 @@ let panX = 0;
 let panY = 0;
 
 let boxes = []; // مربعات الترجمة للصفحة الحالية
+let pageBoxesMap = {}; // حفظ مربعات الترجمة لكل صفحة
 let selectedBoxId = null;
 let showOriginalOnly = false;
 let manualDrawMode = false;
@@ -104,7 +106,7 @@ async function loadPdfFile(file) {
     const arrayBuffer = await file.arrayBuffer();
     pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     currentPageNum = 1;
-
+pageBoxesMap = {};
     dropZone.classList.add('hidden');
     canvasStage.classList.remove('hidden');
 
@@ -129,6 +131,8 @@ function enableControls(enabled) {
   compareBtn.disabled = !enabled;
   exportPngBtn.disabled = !enabled;
   exportPdfBtn.disabled = !enabled;
+  ocrBtn.disabled = !enabled;
+  exportAllPdfBtn.disabled = !enabled;
   zoomInBtn.disabled = !enabled;
   zoomOutBtn.disabled = !enabled;
   fitBtn.disabled = !enabled;
@@ -150,8 +154,15 @@ async function renderPage(pageNum) {
   prevPageBtn.disabled = pageNum <= 1;
   nextPageBtn.disabled = pageNum >= pdfDoc.numPages;
 
-  // استخراج النصوص من الصفحة
-  await extractTextBoxes(page, viewport);
+// استرجاع النصوص المحفوظة للصفحة أو استخراجها لأول مرة
+  if (pageBoxesMap[pageNum]) {
+    boxes = pageBoxesMap[pageNum];
+    selectedBoxId = null;
+  } else {
+    await extractTextBoxes(page, viewport);
+    pageBoxesMap[pageNum] = boxes;
+  }
+
   fitToScreen();
   redrawOverlay();
   renderSidebarList();
@@ -159,6 +170,7 @@ async function renderPage(pageNum) {
 
 prevPageBtn.addEventListener('click', () => {
   if (currentPageNum > 1) {
+    pageBoxesMap[currentPageNum] = boxes;
     currentPageNum--;
     renderPage(currentPageNum);
   }
@@ -166,21 +178,31 @@ prevPageBtn.addEventListener('click', () => {
 
 nextPageBtn.addEventListener('click', () => {
   if (pdfDoc && currentPageNum < pdfDoc.numPages) {
+    pageBoxesMap[currentPageNum] = boxes;
     currentPageNum++;
     renderPage(currentPageNum);
   }
 });
 
 renderScaleSelect.addEventListener('change', () => {
-  if (pdfDoc) renderPage(currentPageNum);
+  if (pdfDoc) {
+    pageBoxesMap = {};
+    renderPage(currentPageNum);
+  }
 });
 
 ignoreNumbersChk.addEventListener('change', () => {
-  if (pdfDoc) renderPage(currentPageNum);
+  if (pdfDoc) {
+    delete pageBoxesMap[currentPageNum];
+    renderPage(currentPageNum);
+  }
 });
 
 mergeLinesChk.addEventListener('change', () => {
-  if (pdfDoc) renderPage(currentPageNum);
+  if (pdfDoc) {
+    delete pageBoxesMap[currentPageNum];
+    renderPage(currentPageNum);
+  }
 });
 
 // ==========================================
@@ -833,3 +855,180 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+// ==========================================
+// 9. ميزة OCR وتصدير كل الصفحات في PDF واحد
+// ==========================================
+function isOverlappingExisting(x, y, w, h) {
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  return boxes.some(
+    (b) => cx >= b.x && cx <= b.x + b.width && cy >= b.y && cy <= b.y + b.height
+  );
+}
+
+ocrBtn.addEventListener('click', async () => {
+  if (!pdfDoc) return;
+  if (typeof Tesseract === 'undefined') {
+    alert('تأكد من الاتصال بالإنترنت لتحميل مكتبة OCR.');
+    return;
+  }
+
+  ocrBtn.disabled = true;
+  translateBtn.disabled = true;
+  showProgress('جاري تهيئة محرك OCR (أول مرة قد تستغرق ثوانٍ)...', 5);
+
+  try {
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: (m) => {
+        if (m.status === 'recognizing text') {
+          showProgress('جاري مسح النصوص المرسومة بالـ OCR...', Math.round(m.progress * 70));
+        }
+      },
+    });
+
+    const { data } = await worker.recognize(pdfCanvas);
+    await worker.terminate();
+
+    const lines = data.lines || [];
+    const newOcrBoxes = [];
+
+    lines.forEach((line, idx) => {
+      const text = (line.text || '').replace(/\s+/g, ' ').trim();
+      if (line.confidence < 45 || !shouldTranslateText(text)) return;
+
+      const { x0, y0, x1, y1 } = line.bbox;
+      const w = Math.max(20, x1 - x0);
+      const h = Math.max(12, y1 - y0);
+
+      if (isOverlappingExisting(x0, y0, w, h)) return;
+
+      newOcrBoxes.push({
+        id: `ocr_${Date.now()}_${idx}`,
+        original: text,
+        translated: '',
+        x: x0,
+        y: y0,
+        width: w,
+        height: h,
+        fontSize: Math.max(10, h * 0.8),
+        angle: 0,
+        fontAdjust: 1,
+        visible: true,
+        manual: false,
+      });
+    });
+
+    if (!newOcrBoxes.length) {
+      hideProgress();
+      alert('لم يتم العثور على نصوص إضافية جديدة عبر OCR في هذه الصفحة.');
+      return;
+    }
+
+    boxes = boxes.concat(newOcrBoxes);
+    pageBoxesMap[currentPageNum] = boxes;
+
+    // ترجمة النصوص المكتشفة فوراً
+    const chunkSize = 12;
+    for (let i = 0; i < newOcrBoxes.length; i += chunkSize) {
+      const chunk = newOcrBoxes.slice(i, i + chunkSize);
+      const translatedArr = await translateBatch(chunk.map((b) => b.original));
+      chunk.forEach((box, idx) => {
+        box.translated = translatedArr[idx] || box.original;
+      });
+      const pct = 70 + Math.round(((i + chunk.length) / newOcrBoxes.length) * 30);
+      showProgress(`جاري ترجمة نصوص OCR (${Math.min(i + chunk.length, newOcrBoxes.length)} / ${newOcrBoxes.length})...`, pct);
+      redrawOverlay();
+    }
+
+    renderSidebarList();
+    hideProgress();
+  } catch (err) {
+    hideProgress();
+    alert('حدث خطأ أثناء مسح OCR: ' + err.message);
+  } finally {
+    ocrBtn.disabled = false;
+    translateBtn.disabled = false;
+  }
+});
+
+exportAllPdfBtn.addEventListener('click', async () => {
+  if (!pdfDoc) return;
+
+  exportAllPdfBtn.disabled = true;
+  exportPdfBtn.disabled = true;
+  translateBtn.disabled = true;
+  ocrBtn.disabled = true;
+
+  const savedPage = currentPageNum;
+  pageBoxesMap[currentPageNum] = boxes;
+
+  try {
+    const { jsPDF } = window.jspdf;
+    let pdf = null;
+
+    for (let p = 1; p <= pdfDoc.numPages; p++) {
+      const basePct = Math.round(((p - 1) / pdfDoc.numPages) * 100);
+      showProgress(`جاري تجهيز وترجمة الصفحة ${p} من ${pdfDoc.numPages}...`, basePct);
+
+      const page = await pdfDoc.getPage(p);
+      const viewport = page.getViewport({ scale: renderScale });
+      pdfCanvas.width = viewport.width;
+      pdfCanvas.height = viewport.height;
+      overlayCanvas.width = viewport.width;
+      overlayCanvas.height = viewport.height;
+
+      await page.render({ canvasContext: pdfCtx, viewport }).promise;
+
+      if (pageBoxesMap[p]) {
+        boxes = pageBoxesMap[p];
+      } else {
+        await extractTextBoxes(page, viewport);
+        pageBoxesMap[p] = boxes;
+      }
+
+      // ترجمة أي نصوص لم تُترجم بعد في هذه الصفحة
+      const pending = boxes.filter((b) => !b.translated);
+      const chunkSize = 12;
+      for (let i = 0; i < pending.length; i += chunkSize) {
+        const chunk = pending.slice(i, i + chunkSize);
+        const translatedArr = await translateBatch(chunk.map((b) => b.original));
+        chunk.forEach((box, idx) => {
+          box.translated = translatedArr[idx] || box.original;
+        });
+      }
+
+      const merged = buildMergedCanvas();
+      const imgData = merged.toDataURL('image/jpeg', 0.92);
+      const orientation = merged.width >= merged.height ? 'l' : 'p';
+
+      if (p === 1) {
+        pdf = new jsPDF({
+          orientation,
+          unit: 'px',
+          format: [merged.width, merged.height],
+          hotfixes: ['px_scaling'],
+        });
+      } else {
+        pdf.addPage([merged.width, merged.height], orientation);
+      }
+
+      pdf.addImage(imgData, 'JPEG', 0, 0, merged.width, merged.height);
+    }
+
+    showProgress('جاري حفظ ملف الـ PDF الكامل...', 99);
+    pdf.save(`${currentFileName}_AR_ALL.pdf`);
+
+    // الرجوع للصفحة اللي كنت واقف عليها
+    currentPageNum = savedPage;
+    await renderPage(savedPage);
+    hideProgress();
+  } catch (err) {
+    hideProgress();
+    alert('حدث خطأ أثناء تصدير كل الصفحات: ' + err.message);
+  } finally {
+    exportAllPdfBtn.disabled = false;
+    exportPdfBtn.disabled = false;
+    translateBtn.disabled = false;
+    ocrBtn.disabled = false;
+  }
+});
