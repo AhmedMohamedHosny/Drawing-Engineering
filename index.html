@@ -12,6 +12,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <!-- مكتبة تصدير النتيجة كملف PDF -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- مكتبة OCR لقراءة النصوص المرسومة كصور أو خطوط -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <!-- الشريط العلوي -->
@@ -30,7 +32,9 @@
       <button id="translateBtn" class="btn btn-accent" disabled>
         ⚡ ترجمة الصفحة تلقائياً
       </button>
-
+<button id="ocrBtn" class="btn btn-secondary" disabled title="قراءة وترجمة النصوص المرسومة كخطوط أو صور">
+        🔍 مسح OCR للرسم
+      </button>
       <button id="manualModeBtn" class="btn btn-secondary" disabled title="ارسم مربعاً على أي نص لم يتم التقاطه تلقائياً">
         ✏️ إضافة نص يدوي
       </button>
@@ -56,6 +60,7 @@
 
       <button id="exportPngBtn" class="btn btn-success" disabled>🖼️ تصدير PNG</button>
       <button id="exportPdfBtn" class="btn btn-success" disabled>📄 تصدير PDF</button>
+      <button id="exportAllPdfBtn" class="btn btn-success" disabled>📚 تصدير كل الصفحات</button>
     </div>
   </header>
 
